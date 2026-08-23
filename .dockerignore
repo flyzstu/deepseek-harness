@@ -1,0 +1,15 @@
+.git
+.agents
+.claude
+.github
+node_modules
+**/node_modules
+**/lib
+**/dist
+**/coverage
+.dsh-build
+*.log
+.env
+.env.*
+.DS_Store
+docs
