@@ -1,0 +1,106 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsh-web
+  labels:
+    app: dsh-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dsh-web
+  template:
+    metadata:
+      labels:
+        app: dsh-web
+    spec:
+      containers:
+        # Main app: dsh web intentionally binds 127.0.0.1:3080 only
+        # (0.0.0.0 is rejected as a remote-code-execution guard).
+        - name: dsh
+          image: coding.fly97.fun:8443/fly97/dsh-web:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - web
+            - --no-open
+            # Add this when a domain (not an IP literal) fronts the service,
+            # otherwise the /api browser-trust fence rejects it:
+            # - --trusted-host
+            # - dsh.example.com:80
+          env:
+            - name: DEEPSEEK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: dsh-secrets
+                  key: deepseek-api-key
+          volumeMounts:
+            - name: data
+              mountPath: /root/.dsh
+          livenessProbe:
+            exec:
+              command:
+                - node
+                - -e
+                - fetch('http://127.0.0.1:3080/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+
+        # Sidecar: expose the loopback-only server to the pod network.
+        # Pod containers share one network namespace, so this listens on a
+        # distinct port (8080) and forwards to the app's 127.0.0.1:3080.
+        - name: tcp-proxy
+          image: alpine/socat:latest
+          command:
+            - socat
+            - TCP-LISTEN:8080,fork,reuseaddr
+            - TCP:127.0.0.1:3080
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: dsh-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dsh-web
+  labels:
+    app: dsh-web
+spec:
+  selector:
+    app: dsh-web
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+  # Pick one: ClusterIP (ingress/port-forward), NodePort, or LoadBalancer.
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dsh-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
