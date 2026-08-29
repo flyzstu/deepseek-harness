@@ -159,32 +159,25 @@ jobs:
           echo "pr_number=$pr_number" >> "$GITHUB_ENV"
           echo "Created PR #$pr_number: $pr_url"
 
-      - name: Enable auto-merge (no-conflict path)
+      - name: Merge sync PR (no-conflict path)
+        # sync PR 反映的是已经过上游 CI 的内容,这里直接合并到 fork master;
+        # 不走 gh pr merge --auto (在 fork 上 enable-auto-merge GraphQL 报
+        # "Pull requests are disabled" 的已知问题)。
         if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ env.pr_number }}
         run: |
-          # 这一步失败 → 整体 workflow 失败 → GitHub 自动发邮件给触发者
-          gh pr merge --auto --squash --delete-branch "$PR_NUMBER"
-
-      - name: Wait for PR to settle (no-conflict path)
-        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ env.pr_number }}
-        run: |
-          echo "Watching PR #$PR_NUMBER checks..."
-          for i in $(seq 1 50); do
-            sleep 30
-            state=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
-            merged=$(gh pr view "$PR_NUMBER" --json merged --jq '.merged')
-            echo "[$i] state=$state merged=$merged"
-            if [ "$merged" = "true" ]; then exit 0; fi
-            if [ "$state" = "CLOSED" ]; then
-              echo "::error::PR #$PR_NUMBER closed without merging (likely CI failed)."
-              exit 1
-            fi
-          done
-          echo "::error::Timed out waiting for PR #$PR_NUMBER to settle."
-          exit 1
+          curl_out=$(mktemp)
+          http_code=$(curl -sS -o "$curl_out" -w "%{http_code}" -X PUT \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/merge" \
+            -d '{"merge_method":"squash"}')
+          result=$(jq -r '.message // .sha // empty' < "$curl_out")
+          rm -f "$curl_out"
+          if [ "$http_code" != "200" ]; then
+            echo "::error::Merge failed (HTTP $http_code): $result"
+            exit 1
+          fi
+          echo "Merged PR #$PR_NUMBER (squash): $result"
