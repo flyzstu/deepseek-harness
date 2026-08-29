@@ -17,8 +17,12 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
+# 注:不用 contents: write 默认 token,因为这个 workflow 实际上是把
+# upstream 推到自己 fork 的 master/分支。需要用 SYNC_TOKEN (classic PAT,
+# 勾 repo + workflow) 来推;GITHUB_TOKEN 仅用于 gh CLI 操作 (pr create,
+# pr view, pr merge)。
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
   actions: read
 
@@ -41,11 +45,12 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Configure git
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "flyzstu"
+          git config user.email "flyzstu@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream master
 
@@ -82,12 +87,15 @@ jobs:
 
       - name: Push sync branch (skip when conflict)
         if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true'
-        run: git push --force-with-lease origin "$PR_BRANCH"
+        run: |
+          # checkout 已用 SYNC_TOKEN,凭证已留在 git 内置 store 中,直接 push 即可。
+          git push --force-with-lease origin "$PR_BRANCH"
 
       - name: Open sync PR
         if: steps.detect.outputs.ahead != '0'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PR 操作可以用 GITHUB_TOKEN (权限足够);PAT 留作 push 用。
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           UPSTREAM_HEAD: ${{ steps.detect.outputs.upstream_head }}
           HAS_CONFLICT: ${{ env.has_conflict }}
         run: |
