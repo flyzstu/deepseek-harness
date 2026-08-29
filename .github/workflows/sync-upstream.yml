@@ -168,22 +168,12 @@ jobs:
       - name: Merge sync PR (no-conflict path)
         # sync PR 反映的是已经过上游 CI 的内容,这里直接合并到 fork master;
         # 不走 gh pr merge --auto (在 fork 上 enable-auto-merge GraphQL 报
-        # "Pull requests are disabled" 的已知问题)。
+        # "Pull requests are disabled" 的已知问题);也不走 REST PUT
+        # /pulls/{n}/merge (fine-grained PAT 在这条路径上 403),而是直接用
+        # gh pr merge 的 mergePullRequest mutation。
         if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ env.pr_number }}
         run: |
-          curl_out=$(mktemp)
-          http_code=$(curl -sS -o "$curl_out" -w "%{http_code}" -X PUT \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/merge" \
-            -d '{"merge_method":"squash"}')
-          result=$(jq -r '.message // .sha // empty' < "$curl_out")
-          rm -f "$curl_out"
-          if [ "$http_code" != "200" ]; then
-            echo "::error::Merge failed (HTTP $http_code): $result"
-            exit 1
-          fi
-          echo "Merged PR #$PR_NUMBER (squash): $result"
+          gh pr merge --squash --delete-branch "$PR_NUMBER"
