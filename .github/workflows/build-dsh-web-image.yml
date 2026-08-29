@@ -32,10 +32,13 @@ concurrency:
 
 jobs:
   build:
+    # sync workflow force-pushes master on both schedule (push-like event)
+    # and workflow_dispatch (synthetic event). Build when the sync concluded
+    # successfully on master; workflow_run.event and head_branch sanity-check
+    # guard against future forks in the triggering workflow.
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'master')
     runs-on: ubuntu-latest
     timeout-minutes: 60
