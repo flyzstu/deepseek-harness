@@ -1,11 +1,8 @@
 name: Expected filenames
 
 on:
-  pull_request:
-    paths:
-      - '*[gG][oO][lL][dD][eE][nN]*'
-      - '**/*[gG][oO][lL][dD][eE][nN]*'
-      - '!vendor/**'
+  # disabled on fork: replaces issues/pull_request/etc with workflow_dispatch only
+  workflow_dispatch:
 
 permissions:
   contents: read
