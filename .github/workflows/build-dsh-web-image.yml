@@ -69,10 +69,20 @@ jobs:
         run: |
           set -e
           while IFS= read -r -d '' link; do
-            target=$(readlink "$link")
-            if [ -e "$target" ]; then
-              cp -a "$target" "$link"
-              echo "Materialized $link -> $target"
+            dir=$(dirname "$link")
+            target_rel=$(readlink "$link")
+            target_abs=$(cd "$dir" && readlink -f "$target_rel")
+            link_abs=$(cd "$dir" && readlink -f "$(basename "$link")")
+            if [ "$target_abs" = "$link_abs" ]; then
+              # self-referential (CLAUDE.md -> AGENTS.md from the same dir);
+              # the cp would fail with "are the same file". Skip and let
+              # BuildKit handle this case directly.
+              continue
+            fi
+            if [ -e "$target_abs" ]; then
+              rm "$link"
+              cp -a "$target_abs" "$link"
+              echo "Materialized $link -> $target_abs"
             fi
           done < <(find . -type l -not -path './.git/*' -print0)
 
