@@ -132,22 +132,23 @@ jobs:
           fi
           # 用 REST API (POST /repos/{owner}/{repo}/pulls) 而非 gh pr create 的 GraphQL,
           # fine-grained PAT 的 Pull requests 权限对 REST 路径验证更稳。
+          body_json=$(jq -Rs . < "$body_file")
+          payload=$(jq -n \
+            --arg title "$title" \
+            --arg head "$PR_BRANCH" \
+            --argjson body "$body_json" \
+            --argjson draft "$draft" \
+            '{title: $title, head: $head, base: "master", body: $body, draft: $draft}')
           pr_url=$(curl -fsS -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-            -d @- <<JSON
-          {
-            "title": "${title}",
-            "head": "${PR_BRANCH}",
-            "base": "master",
-            "body": $(jq -Rs . < "$body_file"),
-            "draft": ${draft}
-          }
-JSON
-          )
-          # pr_url 形如 https://api.github.com/repos/.../pulls/123
+            -d "$payload" | jq -r '.html_url // .message')
           pr_number=$(echo "$pr_url" | tr -d '\n' | awk -F/ '{print $NF}')
+          if [ -z "$pr_number" ] || ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::PR creation failed: $pr_url"
+            exit 1
+          fi
           echo "pr_number=$pr_number" >> "$GITHUB_ENV"
           echo "Created PR #$pr_number: $pr_url"
 
