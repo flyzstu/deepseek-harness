@@ -44,8 +44,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 不在 .git/config 写凭证;push 步骤改用临时凭据 (见下)。
           persist-credentials: false
-          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Configure git
         run: |
@@ -87,8 +87,12 @@ jobs:
 
       - name: Push sync branch (skip when conflict)
         if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true'
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          # checkout 已用 SYNC_TOKEN,凭证已留在 git 内置 store 中,直接 push 即可。
+          # 用 SYNC_TOKEN 配 credential helper;URL 里不出明文,日志也不打印。
+          # run 结束时 helper 即失效。
+          git config --global credential.helper "!f() { echo username=x-access-token; echo password=\$SYNC_TOKEN; }; f"
           git push --force-with-lease origin "$PR_BRANCH"
 
       - name: Open sync PR
