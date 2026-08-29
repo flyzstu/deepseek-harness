@@ -61,30 +61,18 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Materialize symlinks before COPY
-        # examples/CLAUDE.md (and similar) are repo-level symlinks. BuildKit's
-        # source snapshot hits "/examples: not found" when computing the COPY
-        # checksum because of these. Replace each symlink in the build context
-        # with a copy of its target so BuildKit sees regular files.
+      - name: Patch Dockerfile for the fork
+        # Upstream retired top-level examples/ on 2026-08-24; the upstream
+        # Dockerfile still COPY examples ./examples, which fails on this
+        # fork. Comment that line out so the COPY is a no-op.
+        # Reapply if upstream re-introduces the directory.
         run: |
-          set -e
-          while IFS= read -r -d '' link; do
-            dir=$(dirname "$link")
-            target_rel=$(readlink "$link")
-            target_abs=$(cd "$dir" && readlink -f "$target_rel")
-            link_abs=$(cd "$dir" && readlink -f "$(basename "$link")")
-            if [ "$target_abs" = "$link_abs" ]; then
-              # self-referential (CLAUDE.md -> AGENTS.md from the same dir);
-              # the cp would fail with "are the same file". Skip and let
-              # BuildKit handle this case directly.
-              continue
-            fi
-            if [ -e "$target_abs" ]; then
-              rm "$link"
-              cp -a "$target_abs" "$link"
-              echo "Materialized $link -> $target_abs"
-            fi
-          done < <(find . -type l -not -path './.git/*' -print0)
+          if grep -q '^COPY examples \./examples$' Dockerfile; then
+            sed -i 's|^COPY examples \./examples$|# COPY examples ./examples (retired upstream)|' Dockerfile
+            echo "Patched Dockerfile: commented out COPY examples ./examples"
+          else
+            echo "Dockerfile already missing the examples COPY; nothing to patch."
+          fi
 
       - name: Set up QEMU and Buildx
         uses: docker/setup-qemu-action@v3
