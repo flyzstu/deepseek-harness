@@ -61,6 +61,21 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Materialize symlinks before COPY
+        # examples/CLAUDE.md (and similar) are repo-level symlinks. BuildKit's
+        # source snapshot hits "/examples: not found" when computing the COPY
+        # checksum because of these. Replace each symlink in the build context
+        # with a copy of its target so BuildKit sees regular files.
+        run: |
+          set -e
+          while IFS= read -r -d '' link; do
+            target=$(readlink "$link")
+            if [ -e "$target" ]; then
+              cp -a "$target" "$link"
+              echo "Materialized $link -> $target"
+            fi
+          done < <(find . -type l -not -path './.git/*' -print0)
+
       - name: Set up QEMU and Buildx
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
