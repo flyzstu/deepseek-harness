@@ -1,14 +1,19 @@
-# 定时从 upstream 拉取最新提交,如果 origin/master 有新提交就开 sync PR,
-# CI 全过后自动 merge。失败通知依赖 GitHub 内置邮件 (workflow 失败会发到触发者)。
+# 定时从 upstream 拉取最新提交,把 fork-only 的 commits rebase 到上游最新,
+# 然后 force-push 到 fork master。失败通知依赖 GitHub 内置邮件。
 #
 # 触发:
 #   - schedule: 每天 UTC 02:00 (北京时间 10:00)
 #   - workflow_dispatch: 手动立即同步
 #
 # 行为契约:
-#   - origin/master == upstream/master -> 不开 PR,正常退出
-#   - merge 冲突 -> 开 draft PR (人工解决),workflow 整体失败 -> GitHub 自动发邮件
-#   - CI 失败 / auto-merge 失败 -> workflow 整体失败 -> GitHub 自动发邮件
+#   - upstream 没有新提交 -> no-op 退出
+#   - 推送成功 -> workflow 成功 -> 触发 build-dsh-web-image
+#   - rebase 冲突 / push 失败 -> workflow 失败 -> GitHub 自动发邮件给触发者
+#
+# 跳过 PR 流程的原因:这个 fork 上 GraphQL 的所有 pullRequest mutation 都
+# 报 "Pull requests are disabled for this repository",而 REST PUT
+# /pulls/{n}/merge 对 fine-grained PAT 又返回 403,只有 fork owner 的 OAuth
+# 能 merge PR。直接 push master 更简单可靠。
 
 name: Sync upstream (deepseek-ai/deepseek-harness)
 
@@ -17,13 +22,8 @@ on:
     - cron: '0 2 * * *'
   workflow_dispatch:
 
-# 注:不用 contents: write 默认 token,因为这个 workflow 实际上是把
-# upstream 推到自己 fork 的 master/分支。需要用 SYNC_TOKEN (classic PAT,
-# 勾 repo + workflow) 来推;GITHUB_TOKEN 仅用于 gh CLI 操作 (pr create,
-# pr view, pr merge)。
 permissions:
   contents: read
-  pull-requests: write
   actions: read
 
 concurrency:
@@ -32,7 +32,6 @@ concurrency:
 
 env:
   UPSTREAM_REPO: deepseek-ai/deepseek-harness
-  PR_BRANCH: chore/sync-upstream
 
 jobs:
   sync:
@@ -44,7 +43,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # 不在 .git/config 写凭证;push 步骤改用临时凭据 (见下)。
           persist-credentials: false
 
       - name: Configure git
@@ -57,123 +55,39 @@ jobs:
       - name: Detect upstream changes
         id: detect
         run: |
-          if git rev-parse --verify origin/master >/dev/null 2>&1; then
-            ahead=$(git rev-list --count origin/master..upstream/master)
-          else
-            ahead=$(git rev-list --count upstream/master)
-          fi
+          ahead=$(git rev-list --count origin/master..upstream/master)
           echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
           echo "upstream_head=$(git rev-parse upstream/master)" >> "$GITHUB_OUTPUT"
 
       - name: No-op when already in sync
         if: steps.detect.outputs.ahead == '0'
         run: |
-          echo "origin/master already at upstream/master (${UPSTREAM_HEAD:-unknown}). Nothing to do."
+          echo "origin/master already at upstream/master. Nothing to do."
 
-      - name: Create sync branch and merge
+      - name: Rebase fork-only commits onto upstream
         if: steps.detect.outputs.ahead != '0'
-        run: |
-          git push origin --delete "$PR_BRANCH" 2>/dev/null || true
-          git checkout -b "$PR_BRANCH" origin/master 2>/dev/null || git checkout "$PR_BRANCH"
-          if ! git merge --no-ff \
-              -m "chore: sync upstream master (${UPSTREAM_HEAD:0:9})" \
-              -X patience -X renormalize upstream/master; then
-            echo "::error::Merge produced conflicts; aborting the merge."
-            git merge --abort || true
-            echo "has_conflict=true" >> "$GITHUB_ENV"
-          else
-            echo "has_conflict=false" >> "$GITHUB_ENV"
-          fi
-
-      - name: Push sync branch (skip when conflict)
-        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true'
         env:
           SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          # 用 SYNC_TOKEN 配 credential helper;URL 里不出明文,日志也不打印。
-          # run 结束时 helper 即失效。
-          git config --global credential.helper "!f() { echo username=x-access-token; echo password=\$SYNC_TOKEN; }; f"
-          git push --force-with-lease origin "$PR_BRANCH"
-
-      - name: Open sync PR
-        if: steps.detect.outputs.ahead != '0'
-        env:
-          # PR 操作可以用 GITHUB_TOKEN (权限足够);PAT 留作 push 用。
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
-          UPSTREAM_HEAD: ${{ steps.detect.outputs.upstream_head }}
-          HAS_CONFLICT: ${{ env.has_conflict }}
-        run: |
-          # 用 REST 列已存在的同 head/base PR (fine-grained PAT 下 gh pr list 走 GraphQL
-          # searchPullRequests 会返回空,但 REST /pulls 走的是直接 list,能查到)。
-          existing_pr=$(curl -fsS \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:${PR_BRANCH}&base=master&state=open" \
-            | jq -r '.[0].number // empty')
-          if [ -n "$existing_pr" ]; then
-            echo "pr_number=$existing_pr" >> "$GITHUB_ENV"
-            echo "PR #$existing_pr already open for this sync branch."
-            exit 0
-          fi
-          body_file=$(mktemp)
-          {
-            echo "## 自动同步 PR"
-            echo
-            echo "从 \`${UPSTREAM_REPO}@${UPSTREAM_HEAD:0:9}\` 合并到 fork。"
-            echo
-            if [ "$HAS_CONFLICT" = "true" ]; then
-              echo "> **冲突未解决**:分支以未合并状态推送,需要人工解决后再次 push。"
-            fi
-            echo
-            echo "- 上游 head: \`${UPSTREAM_HEAD}\`"
-            echo "- 触发: \`${{ github.event_name }}\`"
-            echo "- 时间: \`$(date -u +%FT%TZ)\`"
-          } > "$body_file"
-          title="chore(sync): upstream @ ${UPSTREAM_HEAD:0:9}"
-          if [ "$HAS_CONFLICT" = "true" ]; then
-            title="$title (CONFLICT)"
-            draft=true
-          else
-            draft=false
-          fi
-          # 用 REST API (POST /repos/{owner}/{repo}/pulls) 而非 gh pr create 的 GraphQL,
-          # fine-grained PAT 的 Pull requests 权限对 REST 路径验证更稳。
-          body_json=$(jq -Rs . < "$body_file")
-          payload=$(jq -n \
-            --arg title "$title" \
-            --arg head "$PR_BRANCH" \
-            --argjson body "$body_json" \
-            --argjson draft "$draft" \
-            '{title: $title, head: $head, base: "master", body: $body, draft: $draft}')
-          curl_out=$(mktemp)
-          http_code=$(curl -sS -o "$curl_out" -w "%{http_code}" -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
-            -d "$payload")
-          pr_url=$(jq -r '.html_url // .message // empty' < "$curl_out")
-          rm -f "$curl_out"
-          if [ "$http_code" != "201" ]; then
-            echo "::error::PR creation failed (HTTP $http_code): $pr_url"
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git checkout master
+          if ! git rebase -X patience -X renormalize upstream/master; then
+            echo "::error::Rebase produced conflicts. Resolve manually:"
+            echo "::error::  git remote set-url origin https://github.com/${GITHUB_REPOSITORY}.git"
+            echo "::error::  git rebase --abort"
+            echo "::error::  git rebase -X patience -X renormalize upstream/master"
+            echo "::error::  git push --force-with-lease origin master"
+            git rebase --abort || true
+            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
             exit 1
           fi
-          pr_number=$(echo "$pr_url" | tr -d '\n' | awk -F/ '{print $NF}')
-          if [ -z "$pr_number" ] || ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
-            echo "::error::PR creation returned non-numeric id: $pr_url"
-            exit 1
-          fi
-          echo "pr_number=$pr_number" >> "$GITHUB_ENV"
-          echo "Created PR #$pr_number: $pr_url"
 
-      - name: Merge sync PR (no-conflict path)
-        # sync PR 反映的是已经过上游 CI 的内容,这里直接合并到 fork master;
-        # 不走 gh pr merge --auto (在 fork 上 enable-auto-merge GraphQL 报
-        # "Pull requests are disabled" 的已知问题);也不走 REST PUT
-        # /pulls/{n}/merge (fine-grained PAT 在这条路径上 403),而是直接用
-        # gh pr merge 的 mergePullRequest mutation。
-        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
+      - name: Force-push rebased master
+        if: steps.detect.outputs.ahead != '0' && success()
         env:
-          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ env.pr_number }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
         run: |
-          gh pr merge --squash --delete-branch "$PR_NUMBER"
+          git remote set-url origin "https://x-access-token:${SYNC_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force-with-lease origin master
+          git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          echo "Pushed $(git rev-parse HEAD) to origin/master"
