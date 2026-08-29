@@ -107,8 +107,9 @@ jobs:
           if [ -n "$existing_pr" ]; then
             echo "pr_number=$existing_pr" >> "$GITHUB_ENV"
             echo "PR #$existing_pr already open for this sync branch."
-            exit 0
+            # exit 0 (默认) — 让后续 enable-auto-merge / wait 步继续运行。
           fi
+          if [ -n "$existing_pr" ]; then exit 0; fi
           body_file=$(mktemp)
           {
             echo "## 自动同步 PR"
@@ -129,17 +130,15 @@ jobs:
               --head "$PR_BRANCH" \
               --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9} (CONFLICT)" \
               --body-file "$body_file" \
-              --draft \
-              --label "kind/chore")
+              --draft)
           else
             pr_url=$(gh pr create \
               --base master \
               --head "$PR_BRANCH" \
               --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9}" \
-              --body-file "$body_file" \
-              --label "kind/chore")
+              --body-file "$body_file")
           fi
-          pr_number=$(echo "$pr_url" | awk -F/ '{print $NF}')
+          pr_number=$(echo "$pr_url" | tr -d '\n' | awk -F/ '{print $NF}')
           echo "pr_number=$pr_number" >> "$GITHUB_ENV"
           echo "Created PR #$pr_number"
 
