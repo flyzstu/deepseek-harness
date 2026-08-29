@@ -1,0 +1,162 @@
+# 定时从 upstream 拉取最新提交,如果 origin/master 有新提交就开 sync PR,
+# CI 全过后自动 merge。失败通知依赖 GitHub 内置邮件 (workflow 失败会发到触发者)。
+#
+# 触发:
+#   - schedule: 每天 UTC 02:00 (北京时间 10:00)
+#   - workflow_dispatch: 手动立即同步
+#
+# 行为契约:
+#   - origin/master == upstream/master -> 不开 PR,正常退出
+#   - merge 冲突 -> 开 draft PR (人工解决),workflow 整体失败 -> GitHub 自动发邮件
+#   - CI 失败 / auto-merge 失败 -> workflow 整体失败 -> GitHub 自动发邮件
+
+name: Sync upstream (deepseek-ai/deepseek-harness)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: deepseek-ai/deepseek-harness
+  PR_BRANCH: chore/sync-upstream
+
+jobs:
+  sync:
+    name: Sync upstream to fork
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream master
+
+      - name: Detect upstream changes
+        id: detect
+        run: |
+          if git rev-parse --verify origin/master >/dev/null 2>&1; then
+            ahead=$(git rev-list --count origin/master..upstream/master)
+          else
+            ahead=$(git rev-list --count upstream/master)
+          fi
+          echo "ahead=$ahead" >> "$GITHUB_OUTPUT"
+          echo "upstream_head=$(git rev-parse upstream/master)" >> "$GITHUB_OUTPUT"
+
+      - name: No-op when already in sync
+        if: steps.detect.outputs.ahead == '0'
+        run: |
+          echo "origin/master already at upstream/master (${UPSTREAM_HEAD:-unknown}). Nothing to do."
+
+      - name: Create sync branch and merge
+        if: steps.detect.outputs.ahead != '0'
+        run: |
+          git push origin --delete "$PR_BRANCH" 2>/dev/null || true
+          git checkout -b "$PR_BRANCH" origin/master 2>/dev/null || git checkout "$PR_BRANCH"
+          if ! git merge --no-ff \
+              -m "chore: sync upstream master (${UPSTREAM_HEAD:0:9})" \
+              -X patience -X renormalize upstream/master; then
+            echo "::error::Merge produced conflicts; aborting the merge."
+            git merge --abort || true
+            echo "has_conflict=true" >> "$GITHUB_ENV"
+          else
+            echo "has_conflict=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Push sync branch (skip when conflict)
+        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true'
+        run: git push --force-with-lease origin "$PR_BRANCH"
+
+      - name: Open sync PR
+        if: steps.detect.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_HEAD: ${{ steps.detect.outputs.upstream_head }}
+          HAS_CONFLICT: ${{ env.has_conflict }}
+        run: |
+          existing_pr=$(gh pr list --head "$PR_BRANCH" --base master --json number --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "$existing_pr" ]; then
+            echo "pr_number=$existing_pr" >> "$GITHUB_ENV"
+            echo "PR #$existing_pr already open for this sync branch."
+            exit 0
+          fi
+          body_file=$(mktemp)
+          {
+            echo "## 自动同步 PR"
+            echo
+            echo "从 \`${UPSTREAM_REPO}@${UPSTREAM_HEAD:0:9}\` 合并到 fork。"
+            echo
+            if [ "$HAS_CONFLICT" = "true" ]; then
+              echo "> **冲突未解决**:分支以未合并状态推送,需要人工解决后再次 push。"
+            fi
+            echo
+            echo "- 上游 head: \`${UPSTREAM_HEAD}\`"
+            echo "- 触发: \`${{ github.event_name }}\`"
+            echo "- 时间: \`$(date -u +%FT%TZ)\`"
+          } > "$body_file"
+          if [ "$HAS_CONFLICT" = "true" ]; then
+            pr_url=$(gh pr create \
+              --base master \
+              --head "$PR_BRANCH" \
+              --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9} (CONFLICT)" \
+              --body-file "$body_file" \
+              --draft \
+              --label "kind/chore")
+          else
+            pr_url=$(gh pr create \
+              --base master \
+              --head "$PR_BRANCH" \
+              --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9}" \
+              --body-file "$body_file" \
+              --label "kind/chore")
+          fi
+          pr_number=$(echo "$pr_url" | awk -F/ '{print $NF}')
+          echo "pr_number=$pr_number" >> "$GITHUB_ENV"
+          echo "Created PR #$pr_number"
+
+      - name: Enable auto-merge (no-conflict path)
+        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ env.pr_number }}
+        run: |
+          # 这一步失败 → 整体 workflow 失败 → GitHub 自动发邮件给触发者
+          gh pr merge --auto --squash --delete-branch "$PR_NUMBER"
+
+      - name: Wait for PR to settle (no-conflict path)
+        if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ env.pr_number }}
+        run: |
+          echo "Watching PR #$PR_NUMBER checks..."
+          for i in $(seq 1 50); do
+            sleep 30
+            state=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+            merged=$(gh pr view "$PR_NUMBER" --json merged --jq '.merged')
+            echo "[$i] state=$state merged=$merged"
+            if [ "$merged" = "true" ]; then exit 0; fi
+            if [ "$state" = "CLOSED" ]; then
+              echo "::error::PR #$PR_NUMBER closed without merging (likely CI failed)."
+              exit 1
+            fi
+          done
+          echo "::error::Timed out waiting for PR #$PR_NUMBER to settle."
+          exit 1
