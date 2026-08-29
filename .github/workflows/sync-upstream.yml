@@ -107,9 +107,8 @@ jobs:
           if [ -n "$existing_pr" ]; then
             echo "pr_number=$existing_pr" >> "$GITHUB_ENV"
             echo "PR #$existing_pr already open for this sync branch."
-            # exit 0 (默认) — 让后续 enable-auto-merge / wait 步继续运行。
+            exit 0
           fi
-          if [ -n "$existing_pr" ]; then exit 0; fi
           body_file=$(mktemp)
           {
             echo "## 自动同步 PR"
@@ -124,23 +123,33 @@ jobs:
             echo "- 触发: \`${{ github.event_name }}\`"
             echo "- 时间: \`$(date -u +%FT%TZ)\`"
           } > "$body_file"
+          title="chore(sync): upstream @ ${UPSTREAM_HEAD:0:9}"
           if [ "$HAS_CONFLICT" = "true" ]; then
-            pr_url=$(gh pr create \
-              --base master \
-              --head "$PR_BRANCH" \
-              --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9} (CONFLICT)" \
-              --body-file "$body_file" \
-              --draft)
+            title="$title (CONFLICT)"
+            draft=true
           else
-            pr_url=$(gh pr create \
-              --base master \
-              --head "$PR_BRANCH" \
-              --title "chore(sync): upstream @ ${UPSTREAM_HEAD:0:9}" \
-              --body-file "$body_file")
+            draft=false
           fi
+          # 用 REST API (POST /repos/{owner}/{repo}/pulls) 而非 gh pr create 的 GraphQL,
+          # fine-grained PAT 的 Pull requests 权限对 REST 路径验证更稳。
+          pr_url=$(curl -fsS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls" \
+            -d @- <<JSON
+          {
+            "title": "${title}",
+            "head": "${PR_BRANCH}",
+            "base": "master",
+            "body": $(jq -Rs . < "$body_file"),
+            "draft": ${draft}
+          }
+JSON
+          )
+          # pr_url 形如 https://api.github.com/repos/.../pulls/123
           pr_number=$(echo "$pr_url" | tr -d '\n' | awk -F/ '{print $NF}')
           echo "pr_number=$pr_number" >> "$GITHUB_ENV"
-          echo "Created PR #$pr_number"
+          echo "Created PR #$pr_number: $pr_url"
 
       - name: Enable auto-merge (no-conflict path)
         if: steps.detect.outputs.ahead != '0' && env.has_conflict != 'true' && env.pr_number != ''
