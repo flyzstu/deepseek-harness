@@ -86,10 +86,13 @@ jobs:
           file: ./Dockerfile
           push: true
           load: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/${{ github.repository_owner }}/deepseek-harness/dsh-web:latest
             ghcr.io/${{ github.repository_owner }}/deepseek-harness/dsh-web:${{ steps.meta.outputs.date_tag }}-${{ steps.meta.outputs.short_sha }}
           build-args: |
             DSH_CLIENT_COMMIT_HASH=${{ steps.meta.outputs.short_sha }}
+          # 用 inline cache: cache metadata 嵌入 image manifest,不上传到 gha。
+          # 避开 cache-from: type=gha + cache-to: type=gha 在含符号链接的 repo 里
+          # 算 checksum 报 "/examples: not found" 的问题。
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/deepseek-harness/dsh-web:latest
+          cache-to: type=inline
