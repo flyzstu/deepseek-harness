@@ -103,7 +103,13 @@ jobs:
           UPSTREAM_HEAD: ${{ steps.detect.outputs.upstream_head }}
           HAS_CONFLICT: ${{ env.has_conflict }}
         run: |
-          existing_pr=$(gh pr list --head "$PR_BRANCH" --base master --json number --jq '.[0].number' 2>/dev/null || true)
+          # 用 REST 列已存在的同 head/base PR (fine-grained PAT 下 gh pr list 走 GraphQL
+          # searchPullRequests 会返回空,但 REST /pulls 走的是直接 list,能查到)。
+          existing_pr=$(curl -fsS \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pulls?head=${GITHUB_REPOSITORY%/*}:${PR_BRANCH}&base=master&state=open" \
+            | jq -r '.[0].number // empty')
           if [ -n "$existing_pr" ]; then
             echo "pr_number=$existing_pr" >> "$GITHUB_ENV"
             echo "PR #$existing_pr already open for this sync branch."
